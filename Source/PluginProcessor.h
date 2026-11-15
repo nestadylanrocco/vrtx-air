@@ -39,11 +39,10 @@ public:
     static juce::AudioProcessorValueTreeState::ParameterLayout createLayout();
     juce::AudioProcessorValueTreeState apvts;
 
-    // Dati per la GUI: picchi in uscita e campioni per lo spettro
+    // Dati per la GUI
     std::atomic<float> peakL { 0.0f }, peakR { 0.0f };
-    static constexpr int analyserSize = 16384;
-    juce::AbstractFifo analyserFifo { analyserSize };
-    std::vector<float> analyserBuffer = std::vector<float> ((size_t) analyserSize, 0.0f);
+    std::atomic<float> midBoostDb { 0.0f }, highBoostDb { 0.0f }; // aria aggiunta (dB)
+    std::atomic<float> hfLevelDb { -100.0f };                      // livello acuti in ingresso
 
 private:
     using SVF = juce::dsp::StateVariableTPTFilter<float>;
@@ -55,12 +54,15 @@ private:
     std::unique_ptr<juce::dsp::Oversampling<float>> oversampler;
     static constexpr int osFactorLog2 = 2; // 4x
 
-    SVF splitMid, splitHigh;   // passa-basso 3k e 10k per separare le bande
-    SVF postMid, postHigh;     // pulizia armoniche generate
+    // Bande stile Dolby-A (passa-basso complementari, nessun buco di fase)
+    SVF lp3k, lp9k;
+    // Sorgente dell'exciter (2-6 kHz) e pulizia delle armoniche generate (>7 kHz, 24 dB/ott)
+    SVF lp2k, lp6k, excHp1, excHp2;
 
     std::array<float, 2> envMid  { 0.0f, 0.0f };
     std::array<float, 2> envHigh { 0.0f, 0.0f };
-    float attackCoef = 0.0f, releaseCoef = 0.0f;
+    std::array<float, 2> envHf   { 0.0f, 0.0f };
+    float attackCoef = 0.0f, releaseCoef = 0.0f, meterCoef = 0.0f;
 
     juce::SmoothedValue<float> midSmooth, highSmooth;
     std::vector<float> midArr, highArr;

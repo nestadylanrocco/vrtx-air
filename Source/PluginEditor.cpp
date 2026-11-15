@@ -218,72 +218,31 @@ void AtmosLookAndFeel::drawTrim (Graphics& g, Rectangle<float> area, float pos, 
 }
 
 //==============================================================================
-SpectrumDisplay::SpectrumDisplay (VRTXAirProcessor& p) : proc (p)
+AirScope::AirScope (VRTXAirProcessor& p) : proc (p)
 {
     setInterceptsMouseClicks (false, false);
+    hfHist.fill (-100.0f);
 }
 
-float SpectrumDisplay::xForFreq (float f) const
+void AirScope::update()
 {
-    return (float) getWidth() * std::log10 (f / 20.0f) / 3.0f;
-}
+    const float m  = proc.midBoostDb.load();
+    const float hi = proc.highBoostDb.load();
+    const float hf = proc.hfLevelDb.load();
 
-float SpectrumDisplay::yForCurveDb (float db) const
-{
-    return (float) getHeight() * 0.62f - db * 7.2f;
-}
+    // movimento morbido ma reattivo
+    midNow  += (m  - midNow)  * 0.5f;
+    highNow += (hi - highNow) * 0.5f;
+    hfNow   += (hf - hfNow)   * (hf > hfNow ? 0.7f : 0.3f);
 
-float SpectrumDisplay::airDb (float f, float mid, float high) const
-{
-    auto hp = [] (float freq, float fc) { const float r = (freq / fc) * (freq / fc); return r / std::sqrt (1.0f + r * r); };
-    const float v = 1.0f + mid * (hp (f, 3000.0f) - hp (f, 10000.0f)) + high * 1.6f * hp (f, 10000.0f);
-    return Decibels::gainToDecibels (v);
-}
-
-void SpectrumDisplay::update()
-{
-    // 1) prendi i nuovi campioni dal processore
-    auto& fifo = proc.analyserFifo;
-    const int ready = fifo.getNumReady();
-    if (ready > 0)
-    {
-        const auto scope = fifo.read (ready);
-        auto take = [&] (int start, int size)
-        {
-            for (int i = 0; i < size; ++i)
-            {
-                history[(size_t) writePos] = proc.analyserBuffer[(size_t) (start + i)];
-                writePos = (writePos + 1) % fftSize;
-            }
-        };
-        if (scope.blockSize1 > 0) take (scope.startIndex1, scope.blockSize1);
-        if (scope.blockSize2 > 0) take (scope.startIndex2, scope.blockSize2);
-    }
-
-    // 2) FFT
-    for (int i = 0; i < fftSize; ++i)
-        fftData[(size_t) i] = history[(size_t) ((writePos + i) % fftSize)];
-    std::fill (fftData.begin() + fftSize, fftData.end(), 0.0f);
-    window.multiplyWithWindowingTable (fftData.data(), (size_t) fftSize);
-    fft.performFrequencyOnlyForwardTransform (fftData.data());
-
-    for (int i = 0; i < fftSize / 2; ++i)
-    {
-        const float db = Decibels::gainToDecibels (fftData[(size_t) i] * 4.0f / (float) fftSize, -120.0f);
-        float& sdb = smoothDb[(size_t) i];
-        sdb = db > sdb ? sdb + (db - sdb) * 0.6f : jmax (db, sdb - 1.4f);
-    }
-
-    // 3) curva: segue i parametri in modo morbido
-    const float tMid  = proc.apvts.getRawParameterValue ("mid")->load()  * 0.01f;
-    const float tHigh = proc.apvts.getRawParameterValue ("high")->load() * 0.01f;
-    shownMid  += (tMid  - shownMid)  * 0.35f;
-    shownHigh += (tHigh - shownHigh) * 0.35f;
-
+    midHist[(size_t) head]  = midNow;
+    highHist[(size_t) head] = highNow;
+    hfHist[(size_t) head]   = hfNow;
+    head = (head + 1) % historySize;
     repaint();
 }
 
-void SpectrumDisplay::paint (Graphics& g)
+void AirScope::paint (Graphics& g)
 {
     const auto b = getLocalBounds().toFloat();
     const float w = b.getWidth(), h = b.getHeight();
@@ -293,105 +252,94 @@ void SpectrumDisplay::paint (Graphics& g)
     g.setColour (Colour (0xff08090d).withAlpha (0.55f));
     g.fillPath (frame);
 
+    g.saveState();
+    g.reduceClipRegion (frame);
+
+    const float top = 56.0f, bottom = h - 28.0f;
+    auto yBoost = [&] (float db) { return bottom - jlimit (0.0f, 1.0f, db / 12.0f) * (bottom - top); };
+    auto yLevel = [&] (float db) { return bottom - jlimit (0.0f, 1.0f, (db + 72.0f) / 60.0f) * (bottom - top) * 0.9f; };
+    auto xAt    = [&] (int i)    { return 16.0f + (w - 64.0f) * (float) i / (float) (historySize - 1); };
+    auto at     = [&] (const std::array<float, historySize>& a, int i) { return a[(size_t) ((head + i) % historySize)]; };
+
+    // griglia: righe dB e un secondo per colonna
+    g.setColour (Colours::white.withAlpha (0.05f));
+    for (float d : { 3.0f, 6.0f, 9.0f, 12.0f })
+        g.drawHorizontalLine (roundToInt (yBoost (d)), 16.0f, w - 48.0f);
+    for (int s = 0; s <= 6; ++s)
+        g.drawVerticalLine (roundToInt (xAt (s * (historySize - 1) / 6)), top - 8.0f, bottom);
+    const float dash[] = { 3.0f, 5.0f };
+    g.setColour (Colours::white.withAlpha (0.14f));
+    g.drawDashedLine (Line<float> (16.0f, bottom, w - 48.0f, bottom), dash, 2, 1.0f);
+
+    auto areaPath = [&] (const std::array<float, historySize>& a, auto mapY)
     {
-        Graphics::ScopedSaveState save (g);
-        g.reduceClipRegion (frame);
-
-        // zone MID e HIGH
-        const float x3 = xForFreq (3000.0f), x10 = xForFreq (10000.0f);
-        g.setGradientFill (ColourGradient (Atmos::cyan.withAlpha (0.07f), 0, 0, Atmos::cyan.withAlpha (0.0f), 0, h, false));
-        g.fillRect (x3, 0.0f, x10 - x3, h);
-        g.setGradientFill (ColourGradient (Atmos::violet.withAlpha (0.09f), 0, 0, Atmos::violet.withAlpha (0.0f), 0, h, false));
-        g.fillRect (x10, 0.0f, w - x10, h);
-
-        // griglia
-        g.setColour (Colours::white.withAlpha (0.05f));
-        for (float f : { 50.0f, 100.0f, 200.0f, 500.0f, 1000.0f, 2000.0f, 5000.0f, 10000.0f, 20000.0f })
-            g.drawVerticalLine (roundToInt (xForFreq (f)), 0.0f, h);
-        for (float d : { -12.0f, -6.0f, 6.0f, 12.0f })
-            g.drawHorizontalLine (roundToInt (yForCurveDb (d)), 0.0f, w);
-        const float dash[] = { 3.0f, 5.0f };
-        g.setColour (Colours::white.withAlpha (0.14f));
-        g.drawDashedLine (Line<float> (0.0f, yForCurveDb (0.0f), w, yForCurveDb (0.0f)), dash, 2, 1.0f);
-
-        // spettro della voce
-        const double sr = proc.getSampleRate() > 0 ? proc.getSampleRate() : 44100.0;
-        const float binHz = (float) sr / (float) fftSize;
-        auto freqAt = [w] (float px) { return 20.0f * std::pow (1000.0f, px / w); };
-
-        Path spec;
-        spec.startNewSubPath (0.0f, h);
-        for (float px = 0.0f; px <= w; px += 2.0f)
+        Path line, fill;
+        for (int i = 0; i < historySize; ++i)
         {
-            const float f0 = freqAt (px), f1 = freqAt (px + 2.0f);
-            const float b0 = f0 / binHz, b1 = f1 / binHz;
-            float db;
-            if (b1 - b0 < 1.0f)
-            {
-                const int i0 = jlimit (0, fftSize / 2 - 2, (int) b0);
-                const float frac = jlimit (0.0f, 1.0f, b0 - (float) i0);
-                db = smoothDb[(size_t) i0] * (1.0f - frac) + smoothDb[(size_t) i0 + 1] * frac;
-            }
-            else
-            {
-                db = -120.0f;
-                for (int i = jlimit (0, fftSize / 2 - 1, (int) b0); i <= jlimit (0, fftSize / 2 - 1, (int) b1); ++i)
-                    db = jmax (db, smoothDb[(size_t) i]);
-            }
-            db += 4.5f * std::log2 (f0 / 1000.0f);  // inclinazione 4.5 dB/ottava, come gli EQ pro
-            const float y = h - jlimit (0.0f, h, jmap (db, -90.0f, 0.0f, 0.0f, h * 0.85f));
-            spec.lineTo (px, y);
+            const Point<float> p { xAt (i), mapY (at (a, i)) };
+            if (i == 0) { line.startNewSubPath (p); fill.startNewSubPath (p.x, bottom); fill.lineTo (p); }
+            else        { line.lineTo (p); fill.lineTo (p); }
         }
-        spec.lineTo (w, h);
-        spec.closeSubPath();
-        g.setGradientFill (ColourGradient (Colours::white.withAlpha (0.16f), 0, 0, Colours::white.withAlpha (0.01f), 0, h, false));
-        g.fillPath (spec);
-
-        // curva dell'aria
-        Path curve;
-        for (int i = 0; i <= 300; ++i)
-        {
-            const float f = 20.0f * std::pow (1000.0f, (float) i / 300.0f);
-            const Point<float> p { xForFreq (f), yForCurveDb (airDb (f, shownMid, shownHigh)) };
-            if (i == 0) curve.startNewSubPath (p); else curve.lineTo (p);
-        }
-
-        Path fill (curve);
-        fill.lineTo (w, yForCurveDb (0.0f));
-        fill.lineTo (0.0f, yForCurveDb (0.0f));
+        fill.lineTo (xAt (historySize - 1), bottom);
         fill.closeSubPath();
-        ColourGradient fg (Atmos::cyan.withAlpha (0.0f), x3 - 80.0f, 0, Atmos::violet.withAlpha (0.30f), w, 0, false);
-        fg.addColour (0.35, Atmos::cyan.withAlpha (0.22f));
-        g.setGradientFill (fg);
-        g.fillPath (fill);
+        return std::make_pair (line, fill);
+    };
 
-        const float widths[] = { 16.0f, 9.0f, 5.0f };
+    // 1) acuti della voce in ingresso (grigio)
+    {
+        auto [line, fill] = areaPath (hfHist, yLevel);
+        g.setGradientFill (ColourGradient (Colours::white.withAlpha (0.13f), 0, top, Colours::white.withAlpha (0.01f), 0, bottom, false));
+        g.fillPath (fill);
+        g.setColour (Colours::white.withAlpha (0.18f));
+        g.strokePath (line, PathStrokeType (1.0f));
+    }
+
+    // 2) aria aggiunta: HIGH (viola) dietro, MID (ciano) davanti
+    auto drawBoost = [&] (const std::array<float, historySize>& a, Colour c)
+    {
+        auto [line, fill] = areaPath (a, yBoost);
+        g.setGradientFill (ColourGradient (c.withAlpha (0.30f), 0, top, c.withAlpha (0.0f), 0, bottom, false));
+        g.fillPath (fill);
+        const float widths[] = { 14.0f, 8.0f, 4.5f };
         const float alphas[] = { 0.05f, 0.10f, 0.18f };
         for (int i = 0; i < 3; ++i)
         {
-            g.setColour (Atmos::cyan.withAlpha (alphas[i]));
-            g.strokePath (curve, PathStrokeType (widths[i], PathStrokeType::curved, PathStrokeType::rounded));
+            g.setColour (c.withAlpha (alphas[i]));
+            g.strokePath (line, PathStrokeType (widths[i], PathStrokeType::curved, PathStrokeType::rounded));
         }
-        ColourGradient lg (Colours::white.withAlpha (0.5f), x3 - 200.0f, 0, Atmos::violet, w, 0, false);
-        lg.addColour (0.45, Atmos::cyan);
-        g.setGradientFill (lg);
-        g.strokePath (curve, PathStrokeType (2.5f, PathStrokeType::curved, PathStrokeType::rounded));
+        g.setColour (c);
+        g.strokePath (line, PathStrokeType (2.2f, PathStrokeType::curved, PathStrokeType::rounded));
+        Atmos::glowDot (g, { xAt (historySize - 1), yBoost (at (a, historySize - 1)) }, 3.5f, c);
+    };
+    drawBoost (highHist, Atmos::violet);
+    drawBoost (midHist,  Atmos::cyan);
 
-        // etichette
-        const auto small = fonts->make (fonts->medium, 9.5f);
-        const std::pair<const char*, float> labels[] = { { "100", 100.0f }, { "1k", 1000.0f }, { "3k", 3000.0f }, { "10k", 10000.0f }, { "20k", 20000.0f } };
-        for (auto& [t, f] : labels)
-            Atmos::text (g, t, jmin (xForFreq (f), w - 14.0f), h - 12.0f, small, Colours::white.withAlpha (0.35f), Justification::centred);
+    // testi
+    const auto title = fonts->make (fonts->semiBold, 9.0f, 2.0f);
+    Atmos::text (g, "AIR SCOPE", 20.0f, 24.0f, title, Colours::white.withAlpha (0.5f));
+    Atmos::text (g, "AIR ADDED TO DETAILS", 20.0f, 40.0f, fonts->make (fonts->medium, 9.0f, 0.5f), Colours::white.withAlpha (0.28f));
 
-        const auto zone = fonts->make (fonts->semiBold, 9.0f, 2.0f);
-        Atmos::text (g, "MID",  (x3 + x10) * 0.5f, 16.0f, zone, Atmos::cyan.withAlpha (0.85f),  Justification::centred);
-        Atmos::text (g, "HIGH", (x10 + w) * 0.5f,  16.0f, zone, Atmos::violet.withAlpha (0.9f), Justification::centred);
+    auto readout = [&] (float rightX, const String& label, float db, Colour c)
+    {
+        const auto big = fonts->make (fonts->displayLight, 24.0f, -0.5f);
+        const auto unit = fonts->make (fonts->medium, 10.0f);
+        const String num = "+" + String (jmax (0.0f, db), 1);
+        const float wNum = GlyphArrangement::getStringWidth (big, num);
+        const float wUnit = GlyphArrangement::getStringWidth (unit, "dB");
+        Atmos::text (g, num, rightX - wUnit - 4.0f - wNum, 28.0f, big, Atmos::textCol);
+        Atmos::text (g, "dB", rightX - wUnit, 32.0f, unit, Colours::white.withAlpha (0.4f));
+        Atmos::text (g, label, rightX - wUnit - 4.0f - wNum - 10.0f, 29.0f, title, c, Justification::centredRight);
+    };
+    readout (w - 20.0f,  "HIGH", highNow, Atmos::violet);
+    readout (w - 160.0f, "MID",  midNow,  Atmos::cyan);
 
-        const auto tiny = fonts->make (fonts->medium, 9.0f);
-        Atmos::text (g, "+6",   14.0f, yForCurveDb (6.0f),        tiny, Colours::white.withAlpha (0.3f));
-        Atmos::text (g, "0 dB", 14.0f, yForCurveDb (0.0f) - 9.0f, tiny, Colours::white.withAlpha (0.3f));
-    }
+    const auto small = fonts->make (fonts->medium, 9.0f);
+    for (auto [t, d] : { std::pair<const char*, float> { "+12", 12.0f }, { "+6", 6.0f }, { "0 dB", 0.0f } })
+        Atmos::text (g, t, w - 42.0f, yBoost (d), small, Colours::white.withAlpha (0.3f));
+    Atmos::text (g, "-6s", xAt (0) + 2.0f, h - 13.0f, small, Colours::white.withAlpha (0.3f));
+    Atmos::text (g, "NOW", xAt (historySize - 1), h - 13.0f, small, Colours::white.withAlpha (0.3f), Justification::centredRight);
 
+    g.restoreState();
     g.setColour (Colours::white.withAlpha (0.07f));
     g.strokePath (frame, PathStrokeType (1.0f));
 }
@@ -564,9 +512,9 @@ void VRTXAirEditor::paint (Graphics& g)
     const auto rng = fonts->make (fonts->medium, 9.5f, 1.0f);
     const String dash = String::fromUTF8 (" \xe2\x80\x93 ");
     Atmos::text (g, "MID AIR",  150.0f, 450.0f, lab, Colours::white.withAlpha (0.82f), Justification::centred);
-    Atmos::text (g, "3" + dash + "10 kHz", 150.0f, 466.0f, rng, Colours::white.withAlpha (0.35f), Justification::centred);
+    Atmos::text (g, "3" + dash + "9 kHz", 150.0f, 466.0f, rng, Colours::white.withAlpha (0.35f), Justification::centred);
     Atmos::text (g, "HIGH AIR", 390.0f, 450.0f, lab, Colours::white.withAlpha (0.82f), Justification::centred);
-    Atmos::text (g, "10" + dash + "20 kHz", 390.0f, 466.0f, rng, Colours::white.withAlpha (0.35f), Justification::centred);
+    Atmos::text (g, "9" + dash + "20 kHz", 390.0f, 466.0f, rng, Colours::white.withAlpha (0.35f), Justification::centred);
 
     // pannello output
     {

@@ -4,18 +4,26 @@
 
 namespace
 {
-    constexpr float midSplitHz  = 3000.0f;   // inizio banda MID AIR
-    constexpr float highSplitHz = 10000.0f;  // inizio banda HIGH AIR
+    // ---- Motore "Dolby-A trick" -------------------------------------------
+    // Una copia della banda viene compressa verso l'alto e sommata in parallelo:
+    // i dettagli deboli (respiri, code delle consonanti) salgono fino a +10/+12 dB,
+    // le parti forti (S, attacchi) restano quasi invariate.
+    constexpr float midThreshold  = 0.015f;  // circa -36 dBFS nella banda 3-9 kHz
+    constexpr float highThreshold = 0.006f;  // circa -44 dBFS nella banda > 9 kHz
+    constexpr float midMaxGain    = 2.16f;   // +10 dB massimi sui dettagli deboli
+    constexpr float highMaxGain   = 2.98f;   // +12 dB massimi
 
-    // Soglie della parte dinamica: sopra questo livello la banda viene esaltata meno
-    constexpr float midThreshold  = 0.08f;
-    constexpr float highThreshold = 0.05f;
+    // ---- Exciter ----------------------------------------------------------
+    constexpr float exciterAmount = 1.1f;    // armoniche nuove sopra i 7 kHz
 
     inline float follow (float env, float input, float att, float rel) noexcept
     {
         const float coef = input > env ? att : rel;
         return input + coef * (env - input);
     }
+
+    // Saturazione morbida sul segnale aggiunto: niente picchi aspri
+    inline float soft (float v) noexcept { return std::tanh (v * 2.0f) * 0.5f; }
 }
 
 VRTXAirProcessor::VRTXAirProcessor()
@@ -75,25 +83,29 @@ void VRTXAirProcessor::prepareToPlay (double sampleRate, int samplesPerBlock)
 
     const double osRate  = sampleRate * (double) (1 << osFactorLog2);
     const int    osBlock = samplesPerBlock * (1 << osFactorLog2);
-
     juce::dsp::ProcessSpec osSpec { osRate, (juce::uint32) osBlock, (juce::uint32) numChannelsPrepared };
 
-    for (auto* f : { &splitMid, &splitHigh, &postMid, &postHigh })
+    auto setup = [&] (SVF& f, SVF::Type type, float hz)
     {
-        f->setType (f == &splitMid || f == &splitHigh ? SVF::Type::lowpass : SVF::Type::highpass);
-        f->setResonance (1.0f / std::sqrt (2.0f));
-        f->prepare (osSpec);
-        f->reset();
-    }
-    splitMid.setCutoffFrequency  (midSplitHz);
-    postMid.setCutoffFrequency   (midSplitHz);
-    splitHigh.setCutoffFrequency (highSplitHz);
-    postHigh.setCutoffFrequency  (highSplitHz);
+        f.setType (type);
+        f.setResonance (1.0f / std::sqrt (2.0f));
+        f.setCutoffFrequency (hz);
+        f.prepare (osSpec);
+        f.reset();
+    };
+    setup (lp3k,   SVF::Type::lowpass,  3000.0f);
+    setup (lp9k,   SVF::Type::lowpass,  9000.0f);
+    setup (lp2k,   SVF::Type::lowpass,  2000.0f);
+    setup (lp6k,   SVF::Type::lowpass,  6000.0f);
+    setup (excHp1, SVF::Type::highpass, 7000.0f);
+    setup (excHp2, SVF::Type::highpass, 7000.0f);
 
-    attackCoef  = (float) std::exp (-1.0 / (0.002 * osRate)); // 2 ms
-    releaseCoef = (float) std::exp (-1.0 / (0.080 * osRate)); // 80 ms
+    attackCoef  = (float) std::exp (-1.0 / (0.001 * osRate)); // 1 ms
+    releaseCoef = (float) std::exp (-1.0 / (0.060 * osRate)); // 60 ms
+    meterCoef   = (float) std::exp (-1.0 / (0.030 * osRate));
     envMid.fill (0.0f);
     envHigh.fill (0.0f);
+    envHf.fill (0.0f);
 
     midSmooth.reset  (osRate, 0.03);
     highSmooth.reset (osRate, 0.03);
@@ -140,11 +152,13 @@ void VRTXAirProcessor::processBlock (juce::AudioBuffer<float>& buffer, juce::Mid
         highArr[(size_t) i] = highSmooth.getNextValue();
     }
 
+    double sumMidGain = 0.0, sumHighGain = 0.0;
+    float hfLevel = 0.0f;
+
     for (int ch = 0; ch < (int) up.getNumChannels(); ++ch)
     {
         float* d = up.getChannelPointer ((size_t) ch);
-        float eM = envMid[(size_t) ch];
-        float eH = envHigh[(size_t) ch];
+        float eM = envMid[(size_t) ch], eH = envHigh[(size_t) ch], eHf = envHf[(size_t) ch];
 
         for (int i = 0; i < n; ++i)
         {
@@ -152,34 +166,39 @@ void VRTXAirProcessor::processBlock (juce::AudioBuffer<float>& buffer, juce::Mid
             const float mAmt = midArr[(size_t) i];
             const float hAmt = highArr[(size_t) i];
 
-            // 1) Separazione con passa-basso complementari (nessun buco di fase):
-            //    banda media = LP10k - LP3k (3-10 kHz), banda alta = x - LP10k (>10 kHz)
-            const float lp3   = splitMid.processSample  (ch, x);
-            const float lp10  = splitHigh.processSample (ch, x);
-            const float bandM = lp10 - lp3;
-            const float bandH = x - lp10;
+            // 1) Bande: MID = 3-9 kHz, HIGH = sopra 9 kHz
+            const float l3 = lp3k.processSample (ch, x);
+            const float l9 = lp9k.processSample (ch, x);
+            const float bandM = l9 - l3;
+            const float bandH = x - l9;
 
-            // 2) Parte dinamica: più la banda è forte, meno la esaltiamo (niente sibilanti aggressive)
+            // 2) Compressione verso l'alto in parallelo (Dolby-A trick)
             eM = follow (eM, std::abs (bandM), attackCoef, releaseCoef);
             eH = follow (eH, std::abs (bandH), attackCoef, releaseCoef);
-            const float dynM = 1.0f / (1.0f + eM / midThreshold);
-            const float dynH = 1.0f / (1.0f + eH / highThreshold);
+            const float gM = juce::jmin (1.0f, midThreshold  / (eM + 1.0e-9f));
+            const float gH = juce::jmin (1.0f, highThreshold / (eH + 1.0e-9f));
 
-            // 3) Armoniche morbide generate dalla banda, poi ripulite sotto la frequenza di taglio
-            const float kM = 3.0f + 6.0f * mAmt;
-            const float kH = 3.0f + 8.0f * hAmt;
-            const float harmM = postMid.processSample  (ch, bandM - std::tanh (bandM * kM) / kM);
-            const float harmH = postHigh.processSample (ch, bandH - std::tanh (bandH * kH) / kH);
+            // 3) Exciter: dalla zona 2-6 kHz nascono armoniche nuove, tenute solo sopra i 7 kHz
+            const float src  = lp6k.processSample (ch, x) - lp2k.processSample (ch, x);
+            const float harm = excHp2.processSample (ch, excHp1.processSample (ch, std::abs (src)));
 
-            // 4) Somma al segnale originale
-            const float addM = mAmt * dynM * (1.0f * bandM + 1.5f * harmM);
-            const float addH = hAmt * dynH * (1.6f * bandH + 2.0f * harmH);
+            const float addM = soft (mAmt * midMaxGain * gM * bandM);
+            const float addH = soft (hAmt * (highMaxGain * gH * bandH + exciterAmount * gH * harm));
 
             d[i] = x + addM + addH;
+
+            if (ch == 0)
+            {
+                sumMidGain  += mAmt * midMaxGain  * gM;
+                sumHighGain += hAmt * highMaxGain * gH;
+                eHf = follow (eHf, std::abs (bandM + bandH), meterCoef, meterCoef);
+                hfLevel = juce::jmax (hfLevel, eHf);
+            }
         }
 
-        envMid[(size_t) ch]  = eM;
+        envMid[(size_t) ch] = eM;
         envHigh[(size_t) ch] = eH;
+        envHf[(size_t) ch] = eHf;
     }
 
     oversampler->processSamplesDown (mainBlock);
@@ -188,26 +207,19 @@ void VRTXAirProcessor::processBlock (juce::AudioBuffer<float>& buffer, juce::Mid
     juce::dsp::ProcessContextReplacing<float> ctx (mainBlock);
     trimGain.process (ctx);
 
-    // Meter L/R (tieni il picco più alto finché la GUI non lo legge)
+    // Dati per la GUI: aria aggiunta sui dettagli (dB) e livello degli acuti
+    const float avgM = (float) (sumMidGain  / (double) juce::jmax (1, n));
+    const float avgH = (float) (sumHighGain / (double) juce::jmax (1, n));
+    const bool active = hfLevel > 1.0e-4f; // sotto -80 dB: silenzio, niente aria da mostrare
+    midBoostDb.store  (active ? juce::Decibels::gainToDecibels (1.0f + avgM) : 0.0f);
+    highBoostDb.store (active ? juce::Decibels::gainToDecibels (1.0f + avgH) : 0.0f);
+    hfLevelDb.store   (juce::Decibels::gainToDecibels (hfLevel, -100.0f));
+
     const int ns = buffer.getNumSamples();
     const float pL = buffer.getMagnitude (0, 0, ns);
     const float pR = numCh > 1 ? buffer.getMagnitude (1, 0, ns) : pL;
     if (pL > peakL.load()) peakL.store (pL);
     if (pR > peakR.load()) peakR.store (pR);
-
-    // Campioni mono per lo spettro della GUI
-    {
-        const auto scope = analyserFifo.write (ns);
-        const float* l = buffer.getReadPointer (0);
-        const float* r = numCh > 1 ? buffer.getReadPointer (1) : l;
-        auto copy = [&] (int start, int size, int offset)
-        {
-            for (int i = 0; i < size; ++i)
-                analyserBuffer[(size_t) (start + i)] = 0.5f * (l[offset + i] + r[offset + i]);
-        };
-        if (scope.blockSize1 > 0) copy (scope.startIndex1, scope.blockSize1, 0);
-        if (scope.blockSize2 > 0) copy (scope.startIndex2, scope.blockSize2, scope.blockSize1);
-    }
 }
 
 void VRTXAirProcessor::getStateInformation (juce::MemoryBlock& destData)

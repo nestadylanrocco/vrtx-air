@@ -2,6 +2,7 @@
 
 #include <juce_gui_basics/juce_gui_basics.h>
 #include <juce_dsp/juce_dsp.h>
+#include <array>
 #include "PluginProcessor.h"
 
 //==============================================================================
@@ -29,32 +30,21 @@ private:
 };
 
 //==============================================================================
-class SpectrumDisplay : public juce::Component
+class AirScope : public juce::Component
 {
 public:
-    explicit SpectrumDisplay (VRTXAirProcessor&);
-    void update();                       // chiamato dal timer dell'editor
+    explicit AirScope (VRTXAirProcessor&);
+    void update();                       // chiamato dal timer dell'editor (30 volte al secondo)
     void paint (juce::Graphics&) override;
 
 private:
-    float xForFreq (float f) const;
-    float yForCurveDb (float db) const;
-    float airDb (float f, float mid, float high) const;
-
+    static constexpr int historySize = 180;   // 6 secondi di storia
     VRTXAirProcessor& proc;
     juce::SharedResourcePointer<VrtxFonts> fonts;
 
-    static constexpr int fftOrder = 11;
-    static constexpr int fftSize  = 1 << fftOrder;
-    juce::dsp::FFT fft { fftOrder };
-    juce::dsp::WindowingFunction<float> window { (size_t) fftSize, juce::dsp::WindowingFunction<float>::hann };
-
-    std::vector<float> history  = std::vector<float> ((size_t) fftSize, 0.0f);
-    std::vector<float> fftData  = std::vector<float> ((size_t) fftSize * 2, 0.0f);
-    std::vector<float> smoothDb = std::vector<float> ((size_t) fftSize / 2, -120.0f);
-    int writePos = 0;
-
-    float shownMid = 0.0f, shownHigh = 0.0f;
+    std::array<float, historySize> midHist {}, highHist {}, hfHist {};
+    int head = 0;
+    float midNow = 0.0f, highNow = 0.0f, hfNow = -100.0f;
 };
 
 //==============================================================================
@@ -92,7 +82,7 @@ private:
     AtmosLookAndFeel lnf;
     juce::Image noiseTile;
 
-    SpectrumDisplay display;
+    AirScope display;
     OutputMeter meter;
     juce::Slider midKnob, highKnob, trimKnob;
 
