@@ -8,13 +8,15 @@ namespace
     // Una copia della banda viene compressa verso l'alto e sommata in parallelo:
     // i dettagli deboli (respiri, code delle consonanti) salgono fino a +10/+12 dB,
     // le parti forti (S, attacchi) restano quasi invariate.
-    constexpr float midThreshold  = 0.015f;  // circa -36 dBFS nella banda 3-9 kHz
-    constexpr float highThreshold = 0.006f;  // circa -44 dBFS nella banda > 9 kHz
-    constexpr float midMaxGain    = 2.16f;   // +10 dB massimi sui dettagli deboli
-    constexpr float highMaxGain   = 2.98f;   // +12 dB massimi
+    constexpr float midThreshold  = 0.08f;   // circa -22 dBFS nella banda MID
+    constexpr float highThreshold = 0.04f;   // circa -28 dBFS nella banda HIGH
+    constexpr float midMaxGain    = 2.0f;    // parte dinamica (dettagli deboli)
+    constexpr float highMaxGain   = 2.5f;
+    constexpr float midStatic     = 1.0f;    // parte fissa (la "base" di brillantezza)
+    constexpr float highStatic    = 1.5f;
 
     // ---- Exciter ----------------------------------------------------------
-    constexpr float exciterAmount = 1.1f;    // armoniche nuove sopra i 7 kHz
+    constexpr float exciterAmount = 2.5f;    // armoniche nuove sopra i 7 kHz
 
     inline float follow (float env, float input, float att, float rel) noexcept
     {
@@ -23,7 +25,7 @@ namespace
     }
 
     // Saturazione morbida sul segnale aggiunto: niente picchi aspri
-    inline float soft (float v) noexcept { return std::tanh (v * 2.0f) * 0.5f; }
+    inline float soft (float v) noexcept { return std::tanh (v * 1.25f) * 0.8f; }
 }
 
 VRTXAirProcessor::VRTXAirProcessor()
@@ -93,7 +95,8 @@ void VRTXAirProcessor::prepareToPlay (double sampleRate, int samplesPerBlock)
         f.prepare (osSpec);
         f.reset();
     };
-    setup (lp3k,   SVF::Type::lowpass,  3000.0f);
+    setup (lp3k,   SVF::Type::bandpass, 5200.0f);
+    lp3k.setResonance (0.6f);
     setup (lp9k,   SVF::Type::lowpass,  9000.0f);
     setup (lp2k,   SVF::Type::lowpass,  2000.0f);
     setup (lp6k,   SVF::Type::lowpass,  6000.0f);
@@ -167,9 +170,9 @@ void VRTXAirProcessor::processBlock (juce::AudioBuffer<float>& buffer, juce::Mid
             const float hAmt = highArr[(size_t) i];
 
             // 1) Bande: MID = 3-9 kHz, HIGH = sopra 9 kHz
-            const float l3 = lp3k.processSample (ch, x);
+            // MID: passa-banda largo centrato a 5.2 kHz (in fase: non taglia mai nulla)
+            const float bandM = lp3k.processSample (ch, x);
             const float l9 = lp9k.processSample (ch, x);
-            const float bandM = l9 - l3;
             const float bandH = x - l9;
 
             // 2) Compressione verso l'alto in parallelo (Dolby-A trick)
@@ -182,15 +185,15 @@ void VRTXAirProcessor::processBlock (juce::AudioBuffer<float>& buffer, juce::Mid
             const float src  = lp6k.processSample (ch, x) - lp2k.processSample (ch, x);
             const float harm = excHp2.processSample (ch, excHp1.processSample (ch, std::abs (src)));
 
-            const float addM = soft (mAmt * midMaxGain * gM * bandM);
-            const float addH = soft (hAmt * (highMaxGain * gH * bandH + exciterAmount * gH * harm));
+            const float addM = soft (mAmt * (midStatic + midMaxGain * gM) * bandM);
+            const float addH = soft (hAmt * ((highStatic + highMaxGain * gH) * bandH + exciterAmount * (0.4f + 0.6f * gH) * harm));
 
             d[i] = x + addM + addH;
 
             if (ch == 0)
             {
-                sumMidGain  += mAmt * midMaxGain  * gM;
-                sumHighGain += hAmt * highMaxGain * gH;
+                sumMidGain  += mAmt * (midStatic  + midMaxGain  * gM);
+                sumHighGain += hAmt * (highStatic + highMaxGain * gH);
                 eHf = follow (eHf, std::abs (bandM + bandH), meterCoef, meterCoef);
                 hfLevel = juce::jmax (hfLevel, eHf);
             }

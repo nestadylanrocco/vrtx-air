@@ -256,14 +256,14 @@ void AirScope::paint (Graphics& g)
     g.reduceClipRegion (frame);
 
     const float top = 56.0f, bottom = h - 28.0f;
-    auto yBoost = [&] (float db) { return bottom - jlimit (0.0f, 1.0f, db / 12.0f) * (bottom - top); };
+    auto yBoost = [&] (float db) { return bottom - jlimit (0.0f, 1.0f, db / 18.0f) * (bottom - top); };
     auto yLevel = [&] (float db) { return bottom - jlimit (0.0f, 1.0f, (db + 72.0f) / 60.0f) * (bottom - top) * 0.9f; };
     auto xAt    = [&] (int i)    { return 16.0f + (w - 64.0f) * (float) i / (float) (historySize - 1); };
     auto at     = [&] (const std::array<float, historySize>& a, int i) { return a[(size_t) ((head + i) % historySize)]; };
 
     // griglia: righe dB e un secondo per colonna
     g.setColour (Colours::white.withAlpha (0.05f));
-    for (float d : { 3.0f, 6.0f, 9.0f, 12.0f })
+    for (float d : { 6.0f, 12.0f, 18.0f })
         g.drawHorizontalLine (roundToInt (yBoost (d)), 16.0f, w - 48.0f);
     for (int s = 0; s <= 6; ++s)
         g.drawVerticalLine (roundToInt (xAt (s * (historySize - 1) / 6)), top - 8.0f, bottom);
@@ -334,7 +334,7 @@ void AirScope::paint (Graphics& g)
     readout (w - 160.0f, "MID",  midNow,  Atmos::cyan);
 
     const auto small = fonts->make (fonts->medium, 9.0f);
-    for (auto [t, d] : { std::pair<const char*, float> { "+12", 12.0f }, { "+6", 6.0f }, { "0 dB", 0.0f } })
+    for (auto [t, d] : { std::pair<const char*, float> { "+18", 18.0f }, { "+9", 9.0f }, { "0 dB", 0.0f } })
         Atmos::text (g, t, w - 42.0f, yBoost (d), small, Colours::white.withAlpha (0.3f));
     Atmos::text (g, "-6s", xAt (0) + 2.0f, h - 13.0f, small, Colours::white.withAlpha (0.3f));
     Atmos::text (g, "NOW", xAt (historySize - 1), h - 13.0f, small, Colours::white.withAlpha (0.3f), Justification::centredRight);
